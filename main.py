@@ -1,38 +1,37 @@
-# %% [markdown]
-# Polymarket — Simple extractor: Tags → Markets (Gamma) → Trade metrics (Data API)
-# Outputs ONE set of CSVs (per-tag + combined). No separate analytics file.
+# Polymarket Fast Aggregator — Events by Base Slug (robust date anchor)
+# Tags → Markets (Gamma) → Aggregated Events (fast-hybrid trades)
+# Merges outcomes into one event, fetches trades for ONE representative market per event.
 
-# %% [code]
-import requests, time, json, csv, unicodedata, sys
+import requests, time, json, csv, unicodedata, re, sys
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
-# ------------------- CONFIG -------------------
+# =================== CONFIG ===================
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_BASE  = "https://data-api.polymarket.com"
+POLY_BASE  = "https://polymarket.com"
 
 URL_TAGS     = f"{GAMMA_BASE}/tags"
 URL_MARKETS  = f"{GAMMA_BASE}/markets"
-URL_TRADES   = f"{DATA_BASE}/trades"   # params: market=<conditionId>, takerOnly=false
+URL_TRADES   = f"{DATA_BASE}/trades"
 
-# Pagination & network
 GAMMA_LIMIT = 250
-DATA_LIMIT  = 500      # adaptive down to 100 on timeouts
+DATA_LIMIT  = 250            # conservative to minimize 408/504
 TIMEOUT     = 20
 MAX_RETRIES = 5
-BACKOFF     = 1.6
+BACKOFF     = 1.8
 
-# Analysis window (inclusive)
+# Analysis window (set to None for full history)
 START_ISO = "2025-01-01T00:00:00Z"
-START_TS  = int(datetime.fromisoformat(START_ISO.replace("Z","+00:00")).timestamp())
+START_TS  = int(datetime.fromisoformat(START_ISO.replace("Z","+00:00")).timestamp()) if START_ISO else None
 
-# ------------------- HELPERS -------------------
+# =================== HELPERS ===================
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "")
     return "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
 
 def _get_json(url: str, params: Dict[str, Any]) -> Any:
-    last = None
+    last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = requests.get(url, params=params, timeout=TIMEOUT)
@@ -42,11 +41,11 @@ def _get_json(url: str, params: Dict[str, Any]) -> Any:
                 raise RuntimeError(f"HTTP {r.status_code}: {r.text[:240]}")
             r.raise_for_status()
         except Exception as e:
-            last = e
+            last_error = e
             time.sleep(BACKOFF ** (attempt - 1))
-    raise RuntimeError(f"GET failed after {MAX_RETRIES} attempts: {last}")
+    raise RuntimeError(f"GET failed after {MAX_RETRIES} attempts: {last_error}")
 
-# ------------------- TAGS -------------------
+# =================== TAGS ===================
 def find_tags_by_query(query: str) -> List[Dict[str, Any]]:
     q = _norm(query)
     out: List[Dict[str, Any]] = []
@@ -63,7 +62,7 @@ def find_tags_by_query(query: str) -> List[Dict[str, Any]]:
         offset += GAMMA_LIMIT
     return out
 
-def print_tags(tags: List[Dict[str, Any]], max_rows: int = 120):
+def print_tags(tags: List[Dict[str, Any]], max_rows: int = 150):
     if not tags:
         print("No matches found."); return
     print(f"Found {len(tags)} tags (showing up to {max_rows})")
@@ -72,13 +71,15 @@ def print_tags(tags: List[Dict[str, Any]], max_rows: int = 120):
         print(f"{i:3d}. id={t.get('id')} | label={t.get('label')} | slug={t.get('slug')}")
     print("-"*95)
 
-# ------------------- GAMMA: MARKETS -------------------
+# =================== GAMMA ===================
 def fetch_markets_by_tag(tag_id: int, closed_flag: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     offset = 0
     while True:
-        params = {"tag_id": tag_id, "related_tags": "true", "closed": closed_flag,
-                  "limit": GAMMA_LIMIT, "offset": offset}
+        params = {
+            "tag_id": tag_id, "related_tags": "true",
+            "closed": closed_flag, "limit": GAMMA_LIMIT, "offset": offset
+        }
         data = _get_json(URL_MARKETS, params)
         if not isinstance(data, list):
             data = data.get("data", []) if isinstance(data, dict) else []
@@ -88,24 +89,48 @@ def fetch_markets_by_tag(tag_id: int, closed_flag: str) -> List[Dict[str, Any]]:
         offset += GAMMA_LIMIT
     return out
 
-def infer_unique_tokens_from_market(m: Dict[str, Any]) -> Optional[int]:
-    for key in ("outcomes","answers","tokens","options"):
-        v = m.get(key)
-        if isinstance(v, list) and v:
-            return len(v)
-    if isinstance(m.get("num_outcomes"), int):
-        return m["num_outcomes"]
-    if str(m.get("type","")).lower() == "binary":
-        return 2
-    return None
+# =================== BASE SLUG (robust date anchor) ===================
+ONE_TOKEN_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+YEAR_RE  = re.compile(r"^\d{4}$")
+MONTH_RE = re.compile(r"^(0[1-9]|1[0-2])$")
+DAY_RE   = re.compile(r"^(0[1-9]|[12]\d|3[01])$")
 
-# ------------------- DATA API: TRADES (robust cursor) -------------------
-def fetch_all_trades_for_condition(condition_id: str) -> List[Dict[str, Any]]:
+def _find_last_date_span(parts: List[str]) -> Optional[Tuple[int,int]]:
+    """
+    Return (start_idx, end_idx) for the LAST date span in parts.
+    Supports:
+      - single token 'YYYY-MM-DD'
+      - three tokens 'YYYY','MM','DD'
+    """
+    last_span: Optional[Tuple[int,int]] = None
+    n = len(parts)
+    for i, p in enumerate(parts):
+        if ONE_TOKEN_DATE_RE.match(p):
+            last_span = (i, i)
+        if i + 2 < n and YEAR_RE.match(parts[i]) and MONTH_RE.match(parts[i+1]) and DAY_RE.match(parts[i+2]):
+            last_span = (i, i+2)
+    return last_span
+
+def base_slug(slug: str) -> str:
+    """Trim everything AFTER the last detected date span; if no date, return slug unchanged."""
+    if not slug:
+        return ""
+    parts = slug.split("-")
+    span = _find_last_date_span(parts)
+    if span:
+        _, end = span
+        return "-".join(parts[:end+1])
+    return slug
+
+def event_url(bslug: str) -> str:
+    return f"{POLY_BASE}/event/{bslug}" if bslug else ""
+
+# =================== TRADES (representative market only) ===================
+def fetch_trades_for_market(condition_id: str) -> List[Dict[str, Any]]:
     trades: List[Dict[str, Any]] = []
+    next_cursor = None
     limit = DATA_LIMIT
-    next_cursor: Optional[str] = None
-    shrinks = 3
-
+    retries_left = 3
     while True:
         params = {"market": condition_id, "takerOnly": "false", "limit": limit}
         if next_cursor:
@@ -114,270 +139,139 @@ def fetch_all_trades_for_condition(condition_id: str) -> List[Dict[str, Any]]:
             resp = _get_json(URL_TRADES, params)
         except RuntimeError as e:
             msg = str(e).lower()
-            if ("408" in msg or "timeout" in msg) and shrinks > 0 and limit > 100:
-                shrinks -= 1
+            if ("timeout" in msg or "408" in msg) and retries_left > 0 and limit > 100:
+                retries_left -= 1
                 limit = max(100, limit // 2)
-                print(f"   [i] Data API timeout → limit {limit}, retry…")
-                time.sleep(1.2); continue
-            raise
-
-        if isinstance(resp, dict) and "data" in resp:
-            items = resp.get("data") or []
-            for it in items:
-                ts = it.get("timestamp")
-                if isinstance(ts, (int,float)) and ts >= START_TS:
-                    trades.append(it)
-            next_cursor = resp.get("next")
-            if not next_cursor or not items:
-                break
-            continue
-
-        # fallback: raw list + offset pagination if needed
-        items = resp if isinstance(resp, list) else []
-        for it in items:
-            ts = it.get("timestamp")
-            if isinstance(ts,(int,float)) and ts >= START_TS:
-                trades.append(it)
-
-        if len(items) >= limit:
-            offset = limit; shrink_left = 2
-            while True:
-                params = {"market": condition_id, "takerOnly": "false", "limit": limit, "offset": offset}
-                try:
-                    resp2 = _get_json(URL_TRADES, params)
-                except RuntimeError as e2:
-                    m2 = str(e2).lower()
-                    if ("408" in m2 or "timeout" in m2) and shrink_left>0 and limit>100:
-                        shrink_left -= 1; limit = max(100, limit//2)
-                        print(f"   [i] Offset timeout → limit {limit}, retry…"); time.sleep(1.2); continue
-                    break
-                items2 = resp2 if isinstance(resp2, list) else resp2.get("data", [])
-                if not items2: break
-                for it in items2:
-                    ts = it.get("timestamp")
-                    if isinstance(ts,(int,float)) and ts >= START_TS:
-                        trades.append(it)
-                if len(items2) < limit: break
-                offset += limit
-        break
+                print(f"   [i] retry trades, new limit={limit}")
+                continue
+            break
+        data = resp.get("data") if isinstance(resp, dict) else resp
+        if not data:
+            break
+        for t in data:
+            ts = t.get("timestamp")
+            if START_TS is None or (isinstance(ts,(int,float)) and ts >= START_TS):
+                trades.append(t)
+        next_cursor = resp.get("next") if isinstance(resp, dict) else None
+        if not next_cursor:
+            break
     return trades
 
-# ------------------- MARKET METRICS (your requested set) -------------------
-def compute_requested_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Required columns:
-      traders_count, total_trades, total_volume_usd, avg_trade_size_usd,
-      avg_volume_per_trader, avg_trades_per_day, min_trade_size_usd,
-      max_trade_size_usd, active_days
-    """
+def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not trades:
-        return {
-            "traders_count": 0,
-            "total_trades": 0,
-            "total_volume_usd": 0.0,
-            "avg_trade_size_usd": 0.0,
-            "avg_volume_per_trader": 0.0,
-            "avg_trades_per_day": 0.0,
-            "min_trade_size_usd": 0.0,
-            "max_trade_size_usd": 0.0,
-            "active_days": 0,
-        }
-
-    traders = set()
+        return dict(traders_count=0,total_trades=0,total_volume_usd=0,
+                    avg_trade_size_usd=0,avg_volume_per_trader=0,
+                    avg_trades_per_day=0,min_trade_size_usd=0,
+                    max_trade_size_usd=0,active_days=0,_traders=set())
     vals = []
+    traders = set()
     first_ts, last_ts = None, None
-
     for tr in trades:
-        price = tr.get("price", 0)
-        size  = tr.get("size", 0)
-        usd   = abs((size or 0) * (price or 0))
-        vals.append(float(usd))
+        size = float(tr.get("size",0) or 0)
+        price = float(tr.get("price",0) or 0)
+        usd = abs(size * price)
+        vals.append(usd)
         addr = (tr.get("proxyWallet") or "").lower()
         if addr: traders.add(addr)
         ts = tr.get("timestamp")
         if isinstance(ts,(int,float)):
-            ts = int(ts)
             if first_ts is None or ts < first_ts: first_ts = ts
-            if last_ts  is None or ts > last_ts:  last_ts  = ts
+            if last_ts is None or ts > last_ts: last_ts = ts
+    total = sum(vals)
+    n = len(vals)
+    tcnt = len(traders)
+    minv = min(vals) if vals else 0
+    maxv = max(vals) if vals else 0
+    avgsize = total / n if n else 0
+    avgvoltr = total / tcnt if tcnt else 0
+    active = int((last_ts-first_ts)/86400)+1 if first_ts and last_ts else 0
+    avgday = n/active if active else 0
+    return dict(traders_count=tcnt,total_trades=n,total_volume_usd=round(total,6),
+                avg_trade_size_usd=round(avgsize,6),avg_volume_per_trader=round(avgvoltr,6),
+                avg_trades_per_day=round(avgday,6),min_trade_size_usd=round(minv,6),
+                max_trade_size_usd=round(maxv,6),active_days=active,_traders=traders)
 
-    total_trades = len(vals)
-    total_volume = float(sum(vals))
-    traders_cnt  = len(traders)
-
-    min_trade = float(min(vals)) if vals else 0.0
-    max_trade = float(max(vals)) if vals else 0.0
-    avg_trade = float(total_volume / total_trades) if total_trades else 0.0
-    avg_vol_per_trader = float(total_volume / traders_cnt) if traders_cnt else 0.0
-
-    if first_ts and last_ts and last_ts >= first_ts:
-        active_days = max(1, int(((last_ts - first_ts)/86400) + 0.999))
-    else:
-        active_days = 0
-    avg_trades_per_day = float(total_trades / active_days) if active_days else 0.0
-
-    return {
-        "traders_count": traders_cnt,
-        "total_trades": total_trades,
-        "total_volume_usd": round(total_volume, 6),
-        "avg_trade_size_usd": round(avg_trade, 6),
-        "avg_volume_per_trader": round(avg_vol_per_trader, 6),
-        "avg_trades_per_day": round(avg_trades_per_day, 6),
-        "min_trade_size_usd": round(min_trade, 6),
-        "max_trade_size_usd": round(max_trade, 6),
-        "active_days": active_days,
-    }
-
-# ------------------- SAVE -------------------
-def save_markets_dump_for_tag(tag_id: int, markets: List[Dict[str, Any]], stamp: str) -> Dict[str, str]:
-    jsonl_path = f"markets_tag_{tag_id}_{stamp}.jsonl"
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for m in markets:
-            f.write(json.dumps(m, ensure_ascii=False) + "\n")
-
-    csv_path = f"markets_tag_{tag_id}_{stamp}.csv"
+# =================== SAVE ===================
+def save_events_csv(path: str, rows: list):
+    # Column order fixed to match your sheet
     fields = [
-        "id","slug","question","category",
-        "liquidity","volume",
-        "condition_id","conditionId",
-        "created_at","updated_at",
-        "unique_tokens",
-        # requested metrics:
-        "traders_count","total_trades","total_volume_usd",
+        "event_key","url","markets_count","unique_tokens",
+        "total_volume_usd","traders_count","total_trades",
         "avg_trade_size_usd","avg_volume_per_trader","avg_trades_per_day",
         "min_trade_size_usd","max_trade_size_usd","active_days",
+        "rep_market_id","rep_condition_id","unique_events","any_question"
     ]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
-        for m in markets:
-            w.writerow({
-                "id": m.get("id",""),
-                "slug": m.get("slug",""),
-                "question": m.get("question",""),
-                "category": m.get("category",""),
-                "liquidity": m.get("liquidity",""),
-                "volume": m.get("volume",""),
-                "condition_id": m.get("condition_id",""),
-                "conditionId": m.get("conditionId",""),
-                "created_at": m.get("created_at",""),
-                "updated_at": m.get("updated_at",""),
-                "unique_tokens": m.get("__unique_tokens",""),
-                "traders_count": m.get("__traders_count",""),
-                "total_trades": m.get("__total_trades",""),
-                "total_volume_usd": m.get("__total_volume_usd",""),
-                "avg_trade_size_usd": m.get("__avg_trade_size_usd",""),
-                "avg_volume_per_trader": m.get("__avg_volume_per_trader",""),
-                "avg_trades_per_day": m.get("__avg_trades_per_day",""),
-                "min_trade_size_usd": m.get("__min_trade_size_usd",""),
-                "max_trade_size_usd": m.get("__max_trade_size_usd",""),
-                "active_days": m.get("__active_days",""),
-            })
-    return {"jsonl": jsonl_path, "csv": csv_path}
-
-def save_combined_markets_csv(path: str, rows: List[Dict[str, Any]]):
-    fields = [
-        "tag_id","id","slug","question","category",
-        "liquidity","volume",
-        "condition_id","conditionId",
-        "created_at","updated_at",
-        "unique_tokens",
-        # requested metrics:
-        "traders_count","total_trades","total_volume_usd",
-        "avg_trade_size_usd","avg_volume_per_trader","avg_trades_per_day",
-        "min_trade_size_usd","max_trade_size_usd","active_days",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+    with open(path,"w",newline="",encoding="utf-8") as f:
+        w=csv.DictWriter(f,fieldnames=fields)
+        w.writeheader()
         for r in rows: w.writerow(r)
 
-# ------------------- MAIN -------------------
+# =================== AGGREGATION ===================
+def aggregate_events(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Group markets into events by robust base slug (trim after last date)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for m in markets:
+        slug = str(m.get("slug",""))
+        bslug = base_slug(slug)
+        groups.setdefault(bslug, []).append(m)
+
+    rows = []
+    unique_events = len(groups)
+
+    for bslug, mkts in groups.items():
+        # Representative = market with maximum Gamma volume
+        rep = max(mkts, key=lambda x: float(x.get("volume",0) or 0.0))
+        cond = rep.get("conditionId") or rep.get("condition_id")
+        trades = fetch_trades_for_market(cond) if cond else []
+        mm = compute_metrics(trades)
+
+        rows.append({
+            "event_key": bslug,
+            "url": event_url(bslug),
+            "markets_count": len(mkts),
+            "unique_tokens": len(mkts),
+            "total_volume_usd": round(sum(float(m.get("volume",0) or 0.0) for m in mkts), 6),  # exact Gamma sum
+            "traders_count": mm["traders_count"],
+            "total_trades": mm["total_trades"],
+            "avg_trade_size_usd": mm["avg_trade_size_usd"],
+            "avg_volume_per_trader": mm["avg_volume_per_trader"],
+            "avg_trades_per_day": mm["avg_trades_per_day"],
+            "min_trade_size_usd": mm["min_trade_size_usd"],
+            "max_trade_size_usd": mm["max_trade_size_usd"],
+            "active_days": mm["active_days"],
+            "rep_market_id": rep.get("id",""),
+            "rep_condition_id": cond or "",
+            "unique_events": unique_events,
+            "any_question": rep.get("question",""),
+        })
+    return rows
+
+# =================== MAIN ===================
 try:
-    query = input("Enter keyword to search tags (e.g. brazil, argentina, soccer): ").strip()
-    if not query: print("Empty query."); raise SystemExit
-    tags = find_tags_by_query(query); print_tags(tags, max_rows=200)
-
-    ids_raw = input("Enter one or more tag_id values separated by commas: ").strip()
-    if not ids_raw: print("No tag_id provided."); raise SystemExit
+    query = input("Enter keyword (e.g. argentina, mexico, soccer): ").strip()
+    if not query: raise SystemExit("Empty query.")
+    tags = find_tags_by_query(query)
+    print_tags(tags)
+    ids_raw = input("Enter tag_id(s), comma-separated: ").strip()
+    if not ids_raw: raise SystemExit("No tag_id provided.")
     tag_ids = [int(x.strip()) for x in ids_raw.split(",") if x.strip()]
-
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    print(f"\nAnalysis start from {START_ISO} (epoch {START_TS})")
 
-    combined_rows: List[Dict[str, Any]] = []
-
+    all_markets: List[Dict[str, Any]] = []
     for tid in tag_ids:
-        print(f"\n==== Processing tag_id={tid} ====")
-        open_mk  = fetch_markets_by_tag(tid, "false"); print(f"  Open markets: {len(open_mk)}")
-        closed_mk= fetch_markets_by_tag(tid, "true");  print(f"  Closed markets: {len(closed_mk)}")
+        print(f"\n==== tag {tid} ====")
+        open_mk  = fetch_markets_by_tag(tid, "false")
+        closed_mk= fetch_markets_by_tag(tid, "true")
+        # de-duplicate by market id
+        mkts = {m["id"]: m for m in open_mk + closed_mk if "id" in m}.values()
+        all_markets.extend(mkts)
+        print(f"  markets total: {len(mkts)}")
 
-        # dedup by market id
-        seen=set(); markets=[]
-        for m in open_mk+closed_mk:
-            mid=str(m.get("id"))
-            if mid not in seen:
-                seen.add(mid); markets.append(m)
-        print(f"  Total markets: {len(markets)}")
-
-        for m in markets:
-            # outcomes count (best-effort)
-            ut = infer_unique_tokens_from_market(m)
-            if ut is not None: m["__unique_tokens"] = int(ut)
-
-            cond = m.get("conditionId") or m.get("condition_id")
-            if cond:
-                try:
-                    trades = fetch_all_trades_for_condition(str(cond))
-                except Exception as e:
-                    print(f"   [warn] trades fetch failed (conditionId={cond}): {e}")
-                    trades = []
-                metrics = compute_requested_metrics(trades)
-            else:
-                metrics = compute_requested_metrics([])
-
-            m["__traders_count"]         = metrics["traders_count"]
-            m["__total_trades"]          = metrics["total_trades"]
-            m["__total_volume_usd"]      = metrics["total_volume_usd"]
-            m["__avg_trade_size_usd"]    = metrics["avg_trade_size_usd"]
-            m["__avg_volume_per_trader"] = metrics["avg_volume_per_trader"]
-            m["__avg_trades_per_day"]    = metrics["avg_trades_per_day"]
-            m["__min_trade_size_usd"]    = metrics["min_trade_size_usd"]
-            m["__max_trade_size_usd"]    = metrics["max_trade_size_usd"]
-            m["__active_days"]           = metrics["active_days"]
-
-        # save per-tag
-        paths = save_markets_dump_for_tag(tid, markets, stamp)
-        print(f"Files for tag {tid}: JSONL={paths['jsonl']} | CSV={paths['csv']}")
-
-        # add to combined
-        for m in markets:
-            combined_rows.append({
-                "tag_id": tid,
-                "id": m.get("id",""),
-                "slug": m.get("slug",""),
-                "question": m.get("question",""),
-                "category": m.get("category",""),
-                "liquidity": m.get("liquidity",""),
-                "volume": m.get("volume",""),
-                "condition_id": m.get("condition_id",""),
-                "conditionId": m.get("conditionId",""),
-                "created_at": m.get("created_at",""),
-                "updated_at": m.get("updated_at",""),
-                "unique_tokens": m.get("__unique_tokens",""),
-                # requested metrics:
-                "traders_count": m.get("__traders_count",""),
-                "total_trades": m.get("__total_trades",""),
-                "total_volume_usd": m.get("__total_volume_usd",""),
-                "avg_trade_size_usd": m.get("__avg_trade_size_usd",""),
-                "avg_volume_per_trader": m.get("__avg_volume_per_trader",""),
-                "avg_trades_per_day": m.get("__avg_trades_per_day",""),
-                "min_trade_size_usd": m.get("__min_trade_size_usd",""),
-                "max_trade_size_usd": m.get("__max_trade_size_usd",""),
-                "active_days": m.get("__active_days",""),
-            })
-
-    # save combined markets only (no analytics file)
-    combined_path = f"markets_all_selected_tags_{stamp}.csv"
-    save_combined_markets_csv(combined_path, combined_rows)
-    print(f"\nCombined markets CSV saved: {combined_path}")
+    print("\nAggregating events ...")
+    events = aggregate_events(list(all_markets))
+    out_csv = f"events_aggregated_{stamp}.csv"
+    save_events_csv(out_csv, events)
+    print(f"Saved aggregated events: {out_csv}")
 
 except KeyboardInterrupt:
-    print("\nStopped by user.", file=sys.stderr)
+    print("\nStopped by user.")
